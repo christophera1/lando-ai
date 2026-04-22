@@ -5,9 +5,11 @@ Answers use a concise format with sources; strict quote validation is optional (
 """
 
 import base64
+import os
 import re
 import json
 import hashlib
+import hmac
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
@@ -80,60 +82,173 @@ def ensure_data_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
+def _clean_api_key_candidate(raw: Optional[str]) -> str:
+    """Treat empty strings and obvious template values as missing."""
+    if raw is None:
+        return ""
+    k = str(raw).strip().strip('"').strip("'")
+    if not k:
+        return ""
+    low = k.lower()
+    if "your_key_here" in low or "changeme" in low or "replace_me" in low:
+        return ""
+    if k in ("...", "xxx", "YOUR_KEY_HERE"):
+        return ""
+    return k
+
+
 def get_api_key() -> str:
     """
-    Resolve the Anthropic API key from secrets or sidebar input.
-    Tries st.secrets first; if missing, loads from .streamlit/secrets.toml next to this app.
+    Resolve the Anthropic API key from secrets, environment, local file, or UI (sidebar / banner).
+    Streamlit Community Cloud injects Secrets into st.secrets (and sometimes into the environment).
     """
     key = ""
-    # 1) Streamlit's st.secrets (loads from cwd's .streamlit/secrets.toml)
+    # 1) Streamlit secrets (Community Cloud + local .streamlit/secrets.toml when present)
     try:
         secrets = st.secrets
         if "ANTHROPIC_API_KEY" in secrets:
-            key = str(secrets["ANTHROPIC_API_KEY"]).strip()
+            key = _clean_api_key_candidate(str(secrets["ANTHROPIC_API_KEY"]))
     except Exception:
         key = ""
 
-    # 2) Fallback: load from .streamlit/secrets.toml next to this script (works if run from wrong cwd)
+    # 2) Environment (some hosts mirror Secrets here)
+    if not key:
+        key = _clean_api_key_candidate(os.environ.get("ANTHROPIC_API_KEY"))
+
+    # 3) Fallback: load from .streamlit/secrets.toml next to this script (works if run from wrong cwd)
     if not key:
         secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
         if secrets_path.exists():
             try:
                 text = secrets_path.read_text(encoding="utf-8")
-                m = re.search(r'ANTHROPIC_API_KEY\s*=\s*["\']([^"\']+)["\']', text)
+                m = re.search(r"ANTHROPIC_API_KEY\s*=\s*[\"']([^\"']+)[\"']", text)
                 if m:
-                    key = m.group(1).strip()
+                    key = _clean_api_key_candidate(m.group(1))
             except Exception:
                 pass
 
     if not key:
-        # Typed in Admin sidebar (password widget); never log or echo this value.
-        key = str(
-            st.session_state.get("sidebar_api_key")
-            or st.session_state.get("api_key", "")
-            or "",
-        ).strip()
+        # Session-only key (banner form or Admin sidebar); never log or echo this value.
+        key = _clean_api_key_candidate(
+            str(
+                st.session_state.get("_lando_session_api_key")
+                or st.session_state.get("sidebar_api_key")
+                or st.session_state.get("api_key", "")
+                or "",
+            )
+        )
 
     return key
 
 
 def _has_server_or_file_api_key() -> bool:
-    """True if the key comes from Streamlit secrets or local secrets.toml (not the sidebar widget)."""
+    """True if a usable key is configured via secrets file / st.secrets / env (not only UI paste)."""
     try:
         secrets = st.secrets
-        if "ANTHROPIC_API_KEY" in secrets and str(secrets["ANTHROPIC_API_KEY"]).strip():
+        if "ANTHROPIC_API_KEY" in secrets and _clean_api_key_candidate(str(secrets["ANTHROPIC_API_KEY"])):
             return True
     except Exception:
         pass
+    if _clean_api_key_candidate(os.environ.get("ANTHROPIC_API_KEY")):
+        return True
     secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
     if secrets_path.exists():
         try:
             text = secrets_path.read_text(encoding="utf-8")
-            if re.search(r"ANTHROPIC_API_KEY\s*=\s*[\"'][^\"']+[\"']", text):
+            m = re.search(r"ANTHROPIC_API_KEY\s*=\s*[\"']([^\"']+)[\"']", text)
+            if m and _clean_api_key_candidate(m.group(1)):
                 return True
         except Exception:
             pass
     return False
+
+
+def get_app_access_password() -> str:
+    """
+    Optional gate: if APP_ACCESS_PASSWORD is set in st.secrets, the whole app is locked
+    until the user enters it (use on Streamlit Cloud even when the app URL is "public").
+    """
+    try:
+        if "APP_ACCESS_PASSWORD" in st.secrets:
+            return str(st.secrets["APP_ACCESS_PASSWORD"]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def require_app_access() -> None:
+    """Stop the script with a login form until APP_ACCESS_PASSWORD matches (if configured)."""
+    pwd = get_app_access_password()
+    if not pwd:
+        return
+    if st.session_state.get("_lando_access_ok"):
+        return
+    st.title("lando.ai")
+    st.caption("This deployment is password-protected.")
+    entered = st.text_input("Access password", type="password", key="_lando_gate_pw")
+    if st.button("Continue", type="primary"):
+        a = (entered or "").strip().encode("utf-8")
+        b = pwd.encode("utf-8")
+        if len(a) == len(b) and hmac.compare_digest(a, b):
+            st.session_state._lando_access_ok = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
+def render_missing_api_key_banner() -> None:
+    """Explain how to enable chat when ANTHROPIC_API_KEY is missing (typical on Streamlit Cloud)."""
+    if get_api_key():
+        return
+    st.error("Chat is off: add your Anthropic API key to Streamlit **Secrets**.")
+    st.markdown(
+        """
+1. Open your app on **[Streamlit Community Cloud](https://share.streamlit.io)**.
+2. Click **⋮ Manage app** → **Settings** → **Secrets**.
+3. Paste (replace with your real key):
+
+```toml
+ANTHROPIC_API_KEY = "sk-ant-api03-..."
+```
+
+4. Click **Save**, then **⋮ Manage app** → **Reboot app**.
+
+**Also set app visibility to Private** (Manage app → **Settings** → **App visibility**) so random visitors cannot open your URL.
+
+**Optional — extra lock:** add a line to Secrets so only people who know it can use the app even if the URL is shared:
+
+```toml
+APP_ACCESS_PASSWORD = "choose-a-strong-password"
+```
+
+Then redeploy / reboot once.
+        """
+    )
+    st.divider()
+    st.markdown(
+        "**Quick fix (this browser only)** — paste your real `sk-ant-…` key and click **Save key for this session** "
+        "(Streamlit may drop a plain text field on rerun; this stores it in session until you close the tab)."
+    )
+    with st.form("lando_session_api_key_form", clear_on_submit=False):
+        _tmp_key = st.text_input(
+            "Anthropic API key",
+            type="password",
+            label_visibility="visible",
+            help="Prefer Streamlit Secrets for production. This path is for quick testing.",
+        )
+        if st.form_submit_button("Save key for this session"):
+            cleaned = _clean_api_key_candidate(_tmp_key)
+            if cleaned:
+                st.session_state["_lando_session_api_key"] = cleaned
+                st.success("Key saved for this session. Scroll down to chat.")
+                st.rerun()
+            else:
+                st.error("That does not look like a real key (too short or still a placeholder).")
+    st.caption(
+        "Troubleshooting: the secret name must be exactly **ANTHROPIC_API_KEY** (all caps, underscores). "
+        "Remove placeholder text like YOUR_KEY_HERE. After editing Secrets, use **Reboot app** once."
+    )
 
 
 def resolve_embedding_device() -> str:
@@ -1014,8 +1129,10 @@ def extract_citations_from_response(
 
 
 # --- Sidebar: Ingestion + status (admin only) ---
+require_app_access()
 ensure_data_dirs()
 inbox_pdfs = sorted(INBOX_DIR.glob("*.pdf"))
+render_missing_api_key_banner()
 
 # --- Main: Chat ---
 st.markdown(
@@ -1394,7 +1511,7 @@ has_api_key = bool(resolved_api_key)
 prompt = st.chat_input(
     "Ask about the document..."
     if has_api_key
-    else "Enable chat: set Streamlit Secrets or Admin → API access.",
+    else "Set ANTHROPIC_API_KEY in Secrets or use Save key in the banner above.",
     disabled=not has_api_key,
 )
 
