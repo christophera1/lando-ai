@@ -1,0 +1,8 @@
+streamlit
+anthropic
+pymupdf
+sentence-transformers
+faiss-cpu
+numpy
+# GPU indexing: install a CUDA build of PyTorch for your system, then restart the app.
+# See https://pytorch.org/get-started/locally/ (pip/conda). CPU-only torch will not use the 5080.

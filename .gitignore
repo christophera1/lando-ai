@@ -1,0 +1,19 @@
+# Never commit real API keys or local secrets
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.zip
+
+# Local uploads and generated index (do not push to GitHub)
+data/inbox/*
+!data/inbox/.gitkeep
+data/index/*
+!data/index/.gitkeep
+**/desktop.ini

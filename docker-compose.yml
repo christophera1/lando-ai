@@ -1,0 +1,12 @@
+services:
+  landdev-ai:
+    build: .
+    container_name: landdev-ai
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - PORT=8501
+    volumes:
+      - ./data:/app/data
+      - ./.streamlit:/app/.streamlit
